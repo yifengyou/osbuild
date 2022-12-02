@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+"""
+Configure firewall
+
+Configure firewalld using the `firewall-offline-cmd` from inside the target.
+
+This stage adds each of the given `ports` and `enabled_services` to the default
+firewall zone using the `--port` and `--service` options, then removes the
+services listed in `disabled_services` with `--remove-service`.
+
+Ports should be specified as "portid:protocol" or "portid-portid:protocol",
+where "portid" is a number (or a port name from `/etc/services`, like "ssh" or
+"echo") and "protocol" is one of "tcp", "udp", "sctp", or "dccp".
+
+Enabling or disabling a service that is already enabled or disabled will not
+cause an error.
+
+Attempting to enable/disable an unknown service name will cause this stage to
+fail. Known service names are determined by the contents of firewalld's
+configuration directories, usually `/{lib,etc}/firewalld/services/*.xml`, and
+may vary from release to release.
+
+WARNING: this stage uses `chroot` to run `firewall-offline-cmd` inside the
+target tree, which means it may fail unexpectedly when the buildhost and target
+are different arches or OSes.
+"""
+
+
+import subprocess
+import sys
+
+import osbuild.api
+
+
+SCHEMA = """
+"additionalProperties": false,
+"properties": {
+  "ports": {
+    "description": "Ports (or port ranges) to open",
+    "type": "array",
+    "items": {
+      "type": "string",
+      "description": "A port or port range: 'portid[-portid]:protocol'",
+      "pattern": ".:(tcp|udp|sctp|dccp)$"
+    }
+  },
+  "enabled_services": {
+    "description": "Network services to allow in the default firewall zone",
+    "type": "array",
+    "items": {
+      "type": "string",
+      "description": "Service name (from /{lib,etc}/firewalld/services/*.xml)"
+    }
+  },
+  "disabled_services": {
+    "description": "Network services to remove from the default firewall zone",
+    "type": "array",
+    "items": {
+      "type": "string",
+      "description": "Service name (from /{lib,etc}/firewalld/services/*.xml)"
+    }
+  },
+  "default_zone": {
+    "description": "Set default zone for connections and interfaces where no zone has been selected.",
+    "type": "string"
+  }
+}
+"""
+
+
+def main(tree, options):
+    # Takes a list of <port|application protocol>:<transport protocol> pairs
+    ports = options.get("ports", [])
+    # These must be defined for firewalld. It has a set of pre-defined services here: /usr/lib/firewalld/services/, but
+    # you can also define you own XML files in /etc/firewalld.
+    enabled_services = options.get("enabled_services", [])
+    disabled_services = options.get("disabled_services", [])
+
+    default_zone = options.get("default_zone", "")
+
+    # firewall-offline-cmd does not implement --root option so we must chroot it
+    if default_zone:
+        subprocess.run(["chroot", tree, "firewall-offline-cmd", f"--set-default-zone={default_zone}"], check=True)
+
+    # The options below are "lokkit" compatibility options and can not be used
+    # with other options.
+    if ports or enabled_services or disabled_services:
+        subprocess.run(["chroot",
+                        tree,
+                        "firewall-offline-cmd"] +
+                       list(map(lambda x: f"--port={x}", ports)) +
+                       list(map(lambda x: f"--service={x}", enabled_services)) +
+                       list(map(lambda x: f"--remove-service={x}", disabled_services)),
+                       check=True)
+
+    return 0
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["tree"], args["options"])
+    sys.exit(r)

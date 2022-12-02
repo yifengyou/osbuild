@@ -1,0 +1,161 @@
+#!/usr/bin/python3
+"""
+Create /etc/fstab entries for filesystems
+
+Each filesystem item must have at least the fs_spec, i.e `uuid`,
+`label`, `partlabel` or `device` and a `path` (mount point).
+
+This stage replaces /etc/fstab, removing any existing entries.
+
+NB: The ostree configuration options are experimental and might
+be replaced with a different mechanism in the near future.
+"""
+
+
+import sys
+
+import osbuild.api
+from osbuild.util import ostree
+
+
+SCHEMA = """
+"additionalProperties": false,
+"required": ["filesystems"],
+"properties": {
+  "ostree": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["deployment"],
+    "properties": {
+      "deployment": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["osname","ref"],
+        "properties": {
+          "osname": {
+            "description": "Name of the stateroot to be used in the deployment",
+            "type": "string"
+          },
+          "ref": {
+            "description": "OStree ref to create and use for deployment",
+            "type": "string"
+          },
+          "serial": {
+            "description": "The deployment serial (usually '0')",
+            "type": "number",
+            "default": 0
+          }
+        }
+      }
+    }
+  },
+  "filesystems": {
+    "type": "array",
+    "description": "array of filesystem objects",
+    "items": {
+      "type": "object",
+      "oneOf": [{
+        "required": ["device", "path"]
+      }, {
+        "required": ["uuid", "path"]
+      }, {
+        "required": ["label", "path"]
+      }, {
+        "required": ["partlabel", "path"]
+      }],
+      "properties": {
+        "device": {
+          "description": "Device node",
+          "type": "string"
+        },
+        "uuid": {
+          "description": "Filesystem UUID",
+          "type": "string"
+        },
+        "label": {
+          "description": "Filesystem label",
+          "type": "string"
+        },
+        "partlabel": {
+          "description": "Partition label.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Filesystem mountpoint",
+          "type": "string"
+        },
+        "vfs_type": {
+          "description": "Filesystem type",
+          "type": "string",
+          "default": "none"
+        },
+        "options": {
+          "description": "Filesystem options (comma-separated)",
+          "type": "string",
+          "default": "defaults"
+        },
+        "freq": {
+          "description": "dump(8) period in days",
+          "type": "number",
+          "default": 0
+        },
+        "passno": {
+          "description": "pass number on parallel fsck(8)",
+          "type": "number",
+          "default": 0
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def main(tree, options):
+    filesystems = options["filesystems"]
+    ostree_options = options.get("ostree")
+
+    path = f"{tree}/etc/fstab"
+
+    if ostree_options:
+        deployment = ostree_options["deployment"]
+        osname = deployment["osname"]
+        ref = deployment["ref"]
+        serial = deployment.get("serial", 0)
+
+        root = ostree.deployment_path(tree, osname, ref, serial)
+
+        print(f"ostree support active: {root}")
+
+        path = f"{root}/etc/fstab"
+
+    with open(path, "w") as f:
+        for filesystem in filesystems:
+            uuid = filesystem.get("uuid")
+            path = filesystem["path"]
+            label = filesystem.get("label")
+            partlabel = filesystem.get("partlabel")
+            device = filesystem.get("device")
+            vfs_type = filesystem.get("vfs_type", "none")
+            options = filesystem.get("options", "defaults")
+            freq = filesystem.get("freq", 0)
+            passno = filesystem.get("passno", 0)
+
+            if uuid:
+                fs_spec = f"UUID={uuid}"
+            elif label:
+                fs_spec = f"LABEL={label}"
+            elif partlabel:
+                fs_spec = f"PARTLABEL={partlabel}"
+            elif device:
+                fs_spec = device
+            else:
+                raise ValueError("Need 'uuid' or 'label'")
+
+            f.write(f"{fs_spec}\t{path}\t{vfs_type}\t{options}\t{freq}\t{passno}\n")
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["tree"], args["options"])
+    sys.exit(r)

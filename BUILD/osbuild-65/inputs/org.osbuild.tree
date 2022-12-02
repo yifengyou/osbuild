@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""
+Tree inputs
+
+Open the tree produced by the pipeline supplied via the
+first and only entry in `references`. The tree is opened
+in read only mode. If the id is `null` or the empty
+string it returns an empty tree.
+"""
+
+import sys
+
+from osbuild import inputs
+
+
+SCHEMA = """
+"additionalProperties": false,
+"required": ["type", "origin", "references"],
+"properties": {
+  "type": {
+    "enum": ["org.osbuild.tree"]
+  },
+  "origin": {
+    "description": "The origin of the input (must be 'org.osbuild.pipeline')",
+    "type": "string",
+    "enum": ["org.osbuild.pipeline"]
+  },
+  "references": {
+    "description": "Exactly one pipeline identifier to use as tree input",
+    "oneOf": [{
+      "type": "array",
+      "additionalItems": false,
+      "minItems": 1,
+      "maxItems": 1,
+      "items": [{
+        "type": "string"
+      }]
+    }, {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+         ".*": {
+           "type": "object",
+           "additionalProperties": false
+         }
+       },
+       "minProperties": 1,
+       "maxProperties": 1
+    }, {
+      "type": "array",
+      "additionalItems": false,
+      "minItems": 1,
+      "maxItems": 1,
+      "items": [{
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        }
+      }]
+    }]
+  }
+}
+"""
+
+
+class TreeInput(inputs.InputService):
+
+    def map(self, store, _origin, refs, target, _options):
+
+        # input verification *must* have been done via schema
+        # verification. It is expected that origin is a pipeline
+        # and we have exactly one reference, i.e. a pipeline id
+        pid, _ = refs.popitem()
+
+        if pid:
+            path = store.read_tree_at(pid, target)
+
+        if not path:
+            raise ValueError(f"Unknown pipeline '{pid}'")
+
+        reply = {"path": target}
+        return reply
+
+
+def main():
+    service = TreeInput.from_args(sys.argv[1:])
+    service.main()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,3 +1,9 @@
+BUILDROOT
+SRPMS
+RPMS
+*.rpm
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

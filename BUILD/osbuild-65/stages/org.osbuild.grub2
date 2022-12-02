@@ -1,0 +1,604 @@
+#!/usr/bin/python3
+"""
+Configure GRUB2 bootloader and set boot options
+
+Configure the system to use GRUB2 as the bootloader, and set boot options.
+
+Sets the GRUB2 boot/root filesystem to `rootfs`. If a separated boot
+partition is used it can be specified via `bootfs`. The file-systems
+can be identified either via uuid (`{"uuid": "<uuid>"}`) or label
+(`{"label": "<label>"}`). The kernel boot argument will be composed
+of the root file system id and additional options specified in
+`{kernel_opts}`, if any.
+
+Configures GRUB2 to boot via the Boot Loader Specification
+(https://systemd.io/BOOT_LOADER_SPECIFICATION), which is the default
+behavior in Fedora 30 and later.
+
+This stage will overwrite `/etc/default/grub`, `/boot/grub2/grubenv`, and
+`/boot/grub2/grub.cfg`. (Leading directories will be created if not present.)
+
+If Legacy boot support is requested via `legacy` this stage will also
+overwrite `/boot/grub2/grub.cfg` and will copy the GRUB2 files from the
+buildhost into the target tree:
+* `/usr/share/grub/unicode.pf2`          -> `/boot/grub2/fonts/`
+* `/usr/lib/grub/$platform/*.{mod,lst}` -> `/boot/grub2/$platform/`
+  * NOTE: skips `fdt.lst`, which is an empty file
+The $platform variable (default: i386-pc) refers to target platform
+that grub2 is mean to ran on (see grub-install(1)'s `--target`)
+
+NB: with legacy support enabled, this stage will fail if the buildhost
+doesn't have `/usr/lib/grub/$platform/` and `/usr/share/grub/unicode.pf2`.
+
+If UEFI support is enabled via `uefi: {"vendor": "<vendor>"}` this stage will
+also write the `grub.cfg` to `boot/efi/EFI/<vendor>/grub.cfg`. EFI binaries
+and accompanying data can be installed from the built root via `uefi.install`.
+
+Both UEFI and Legacy can be specified at the same time (hybrid boot).
+
+If `uefi.unified` is specified or hybrid boot is enabled, the main grub config
+will be written to `boot/grub2/grub.cfg` and a redirect config will be placed
+in the EFI directory.
+
+If the `saved_entry` option is present it will result in an entry in the
+`grubenv` file of the same name. The grub config file contains logic so
+that this variable will be used to select the next boot entry. This will
+also make grub2-reboot and grub2-set-default tools work. It will also
+prevent newly installed non-default kernels (like e.g. the debug kernel)
+to be selected as default. The contents of variable needs to match the
+corresponding loader entry, which currently is a combination of the
+machine id and kernel NVRA, like e.g.:
+  `ffffffffffffffffffffffffffffffff-5.6.6-300.fc32.x86_64`
+If `saved_entry` is set it is advisable to set `config.default` to
+`saved` so that any re-creation of the grub configuration by the
+user will preserve that functionality.
+
+Support for "greenboot" can be turned on via the `greenboot` option.
+Greenboot is the idea of automatically rolling back bad updates,
+i.e. updates that do not boot successfully. The implementation
+is split between the boot loader and a user space component.
+The latter sets two variables `boot_counter`, which indicates
+the maximum number of boot attempts and `boot_success` which
+tells the boot laoder if a previous boot was successful. The
+bootloader on the other hand will decrement the counter variable
+and reset the success indicator one.
+An implementation of the user space component for rpm-ostree is
+called `greenboot`.
+
+Support for ignition (https://github.com/coreos/ignition) can be turned
+on via the `ignition` option. If enabled, a 'ignition_firstboot' variable
+will be created, which is meant to be included in the kernel command line.
+The grub.cfg will then contain the necessary code to detect and source
+the '/boot/ignition.firstboot' file and configure said 'ignition_firstboot'
+variable appropriately. See the 'org.osbuild.ignition' stage for more
+information on that file.
+"""
+
+
+import os
+import shutil
+import string
+import sys
+
+import osbuild.api
+
+
+SCHEMA = """
+"additionalProperties": false,
+"oneOf": [{
+  "required": ["root_fs_uuid"]
+}, {
+  "required": ["rootfs"]
+}],
+"definitions": {
+  "uuid": {
+    "description": "Identify the file system by UUID",
+    "type": "string",
+    "oneOf": [
+      { "pattern": "^[0-9A-Za-z]{8}(-[0-9A-Za-z]{4}){3}-[0-9A-Za-z]{12}$",
+        "examples": ["9c6ae55b-cf88-45b8-84e8-64990759f39d"] },
+      { "pattern": "^[0-9A-Za-z]{4}-[0-9A-Za-z]{4}$",
+        "examples": ["6699-AFB5"] }
+    ]
+  },
+  "filesystem": {
+    "description": "Description of how to locate a file system",
+    "type": "object",
+    "oneOf": [{
+      "required": ["uuid"]
+    }, {
+      "required": ["label"]
+    }],
+    "properties": {
+      "label": {
+        "description": "Identify the file system by label",
+        "type": "string"
+      },
+      "uuid": { "$ref": "#/definitions/uuid" }
+    }
+  },
+  "terminal": {
+    "description": "Terminal device",
+    "type": "array",
+    "items": {
+      "type": "string"
+    }
+  }
+},
+"properties": {
+  "rootfs": { "$ref": "#/definitions/filesystem" },
+  "bootfs": { "$ref": "#/definitions/filesystem" },
+  "root_fs_uuid": { "$ref": "#/definitions/uuid" },
+  "boot_fs_uuid": { "$ref": "#/definitions/uuid" },
+  "kernel_opts": {
+    "description": "Additional kernel boot options",
+    "type": "string",
+    "default": ""
+  },
+  "legacy": {
+    "description": "Include legacy boot support",
+    "oneOf": [
+      {"type": "boolean", "default": false},
+      {"type": "string"}
+    ]
+  },
+  "uefi": {
+    "description": "Include UEFI boot support",
+    "type": "object",
+    "required": ["vendor"],
+    "properties": {
+      "vendor": {
+        "type": "string",
+         "description": "The vendor of the UEFI binaries (this is us)",
+         "examples": ["fedora"],
+         "pattern": "^(.+)$"
+      },
+      "install": {
+        "description": "Install EFI binaries and data from the build root",
+        "type": "boolean",
+        "default": false
+      },
+      "unified": {
+        "description": "Main grub config in 'boot/grub2/grub.cfg'",
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "saved_entry": {
+    "description": "Set the variable of the same name in `grubenv`.",
+    "type": "string"
+  },
+  "write_defaults": {
+    "description": "Whether to write /etc/defaults/grub",
+    "type": "boolean",
+    "default": true
+  },
+  "write_cmdline": {
+    "description": "Include the kernel command line in `grubenv`",
+    "type": "boolean",
+    "default": true
+  },
+  "ignition": {
+    "description": "Include ignition support in the grub.cfg",
+    "type": "boolean",
+    "default": false
+  },
+  "greenboot": {
+    "description": "Include support for fallback counting",
+    "type": "boolean",
+    "default": false
+  },
+  "config": {
+    "description": "Configuration options for grub itself",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "default": {
+        "description": "Default boot entry",
+        "type": "string"
+      },
+      "terminal_input": {
+         "$ref": "#/definitions/terminal"
+      },
+      "terminal_output": {
+         "$ref": "#/definitions/terminal"
+      },
+      "timeout": {
+        "description": "Timeout in seconds",
+        "type": "integer",
+        "minimum": 0,
+        "default": 0
+      },
+      "serial": {
+        "description": "The command to configure the serial console",
+        "type": "string"
+      }
+    }
+  }
+}
+"""
+
+
+# The main grub2 configuration file template. Used for UEFI and legacy
+# boot. The parameters are currently:
+#   - $search: to specify the search criteria of how to locate grub's
+#     "root device", i.e. the device where the "OS images" are stored.
+#   - $ignition: configuration for ignition, if support for ignition
+#     is enabled
+GRUB_CFG_TEMPLATE = """
+set timeout=${timeout}
+
+# load the grubenv file
+load_env
+
+# selection of the next boot entry via variables 'next_entry' and
+# `saved_entry` present in the 'grubenv' file. Both variables are
+# set by grub tools, like grub2-reboot, grub2-set-default
+
+if [ "${next_entry}" ] ; then
+   set default="${next_entry}"
+   set next_entry=
+   save_env next_entry
+   set boot_once=true
+else
+   set default="${saved_entry}"
+fi
+
+search --no-floppy --set=root $search
+set boot=$${root}
+function load_video {
+  insmod all_video
+}
+${features}${serial}${terminal_input}${terminal_output}
+blscfg
+"""
+
+
+# The grub2 redirect configuration template. This is used in case of
+# hybrid (uefi + legacy) boot. In this case this configuration, which
+# is located in the EFI directory, will redirect to the main grub.cfg
+# (GRUB_CFG_TEMPLATE).
+# The parameters are:
+#   - $root: specifies the path to the grub2 directory relative to
+#     to the file-system where the directory is located on
+GRUB_REDIRECT_TEMPLATE = """
+search --no-floppy --set prefix --file ${root}grub2/grub.cfg
+set prefix=($$prefix)${root}grub2
+configfile $$prefix/grub.cfg
+"""
+
+
+# Template for ignition support in the grub.cfg
+#
+# it was taken verbatim from Fedora CoreOS assembler's grub.cfg
+# See https://github.com/coreos/coreos-assembler/
+#
+# The parameters are:
+#   - $root: specifies the path to the grub2 directory relative
+#     to the file-system where the directory is located on
+
+IGNITION_TEMPLATE = """
+# Ignition support
+set ignition_firstboot=""
+if [ -f "${root}ignition.firstboot" ]; then
+    # Default networking parameters to be used with ignition.
+    set ignition_network_kcmdline=''
+
+    # Source in the `ignition.firstboot` file which could override the
+    # above $ignition_network_kcmdline with static networking config.
+    # This override feature is primarily used by coreos-installer to
+    # persist static networking config provided during install to the
+    # first boot of the machine.
+    source "${root}ignition.firstboot"
+
+    set ignition_firstboot="ignition.firstboot $${ignition_network_kcmdline}"
+fi
+"""
+
+
+GREENBOOT = """
+# greenboot support, aka boot counter and boot success reporting
+insmod increment
+# Check if boot_counter exists and boot_success=0 to activate this behaviour.
+if [ -n "${boot_counter}" -a "${boot_success}" = "0" ]; then
+  # if countdown has ended, choose to boot rollback deployment,
+  # i.e. default=1 on OSTree-based systems.
+  if  [ "${boot_counter}" = "0" -o "${boot_counter}" = "-1" ]; then
+    set default=1
+    set boot_counter=-1
+  # otherwise decrement boot_counter
+  else
+    decrement boot_counter
+  fi
+  save_env boot_counter
+fi
+
+# Reset boot_success for current boot
+set boot_success=0
+save_env boot_success
+"""
+
+
+def fs_spec_decode(spec):
+    for key in ["uuid", "label"]:
+        val = spec.get(key)
+        if val:
+            return key.upper(), val
+    raise ValueError("unknown filesystem type")
+
+
+def copy_modules(tree, platform):
+    """Copy all modules from the build image to /boot"""
+    target = f"{tree}/boot/grub2/{platform}"
+    source = f"/usr/lib/grub/{platform}"
+    os.makedirs(target, exist_ok=True)
+    for dirent in os.scandir(source):
+        (_, ext) = os.path.splitext(dirent.name)
+        if ext not in ('.mod', '.lst'):
+            continue
+        if dirent.name == "fdt.lst":
+            continue
+        shutil.copy2(f"/{source}/{dirent.name}", target)
+
+
+def copy_font(tree):
+    """Copy a unicode font into /boot"""
+    os.makedirs(f"{tree}/boot/grub2/fonts", exist_ok=True)
+    shutil.copy2("/usr/share/grub/unicode.pf2", f"{tree}/boot/grub2/fonts/")
+
+
+def copy_efi_data(tree, vendor):
+    """Copy the EFI binaries & data into /boot/efi"""
+    for d in ['BOOT', vendor]:
+        source = f"/boot/efi/EFI/{d}"
+        target = f"{tree}/boot/efi/EFI/{d}/"
+        shutil.copytree(source, target,
+                        symlinks=False)
+
+
+# pylint: disable=too-many-instance-attributes
+class GrubConfig:
+    def __init__(self, rootfs, bootfs):
+        self.rootfs = rootfs
+        self.bootfs = bootfs
+        self.path = "boot/grub2/grub.cfg"
+        self.default_entry = None
+        self.ignition = False
+        self.greenboot = False
+        self.kernel_opts = ""
+        self.serial = ""
+        self.terminal_input = None
+        self.terminal_output = None
+        self.timeout = 0
+
+    @property
+    def grubfs(self):
+        """The filesystem containing the grub files,
+
+        This is either a separate partition (self.bootfs if set) or
+        the root file system (self.rootfs)
+        """
+        return self.bootfs or self.rootfs
+
+    @property
+    def separate_boot(self):
+        return self.bootfs is not None
+
+    @property
+    def grub_home(self):
+        return "/" if self.separate_boot else "/boot/"
+
+    def make_terminal_config(self, terminal):
+        config = getattr(self, terminal)
+        if not config:
+            return {}
+
+        val = (
+            "\n" +
+            terminal +
+            " " +
+            " ".join(config)
+        )
+        return {terminal: val}
+
+    def write(self, tree):
+        """Write the grub config to `tree` at `self.path`"""
+        path = os.path.join(tree, self.path)
+
+        fs_type, fs_id = fs_spec_decode(self.grubfs)
+        type2opt = {
+            "UUID": "--fs-uuid",
+            "LABEL": "--label"
+        }
+
+        ignition = ""
+        if self.ignition:
+            tplt = string.Template(IGNITION_TEMPLATE)
+            subs = {"root": self.grub_home}
+            ignition = tplt.safe_substitute(subs)
+
+        greenboot = ""
+        if self.greenboot:
+            greenboot = GREENBOOT
+
+        features = "\n".join(filter(bool, [ignition, greenboot]))
+
+        # configuration options for the main template
+        config = {
+            "timeout": self.timeout,
+            "search": type2opt[fs_type] + " " + fs_id,
+            "features": features,
+        }
+
+        if self.serial:
+            config["serial"] = "\n" + self.serial
+
+        config.update(self.make_terminal_config("terminal_input"))
+        config.update(self.make_terminal_config("terminal_output"))
+
+        tplt = string.Template(GRUB_CFG_TEMPLATE)
+        data = tplt.safe_substitute(config)
+
+        with open(path, "w") as cfg:
+            cfg.write(data)
+
+    def write_redirect(self, tree, path):
+        """Write a grub config pointing to the other cfg"""
+        print("hybrid boot or unified grub config enabled. "
+              "Writing alias grub config")
+
+        # configuration options for the template
+        config = {
+            "root": self.grub_home
+        }
+
+        tplt = string.Template(GRUB_REDIRECT_TEMPLATE)
+        data = tplt.safe_substitute(config)
+
+        with open(os.path.join(tree, path), "w") as cfg:
+            cfg.write(data)
+
+    def defaults(self):
+        # NB: The "GRUB_CMDLINE_LINUX" variable contains the kernel command
+        # line but without the `root=` part, thus we just use `kernel_opts`.
+        data = (
+            f'GRUB_CMDLINE_LINUX="{self.kernel_opts}"\n'
+            f"GRUB_TIMEOUT={self.timeout}\n"
+            "GRUB_ENABLE_BLSCFG=true\n"
+        )
+
+        if self.serial:
+            data += f'GRUB_SERIAL_COMMAND="{self.serial}"\n'
+
+        if self.terminal_input:
+            val = " ".join(self.terminal_input)
+            data += f'GRUB_TERMINAL_INPUT="{val}"\n'
+
+        if self.terminal_output:
+            val = " ".join(self.terminal_output)
+            data += f'GRUB_TERMINAL_OUTPUT="{val}"\n'
+
+        if self.default_entry is not None:
+            data += f'GRUB_DEFAULT={self.default_entry}\n'
+
+        return data
+
+
+#pylint: disable=too-many-statements,too-many-branches
+def main(tree, options):
+    root_fs = options.get("rootfs")
+    boot_fs = options.get("bootfs")
+    kernel_opts = options.get("kernel_opts", "")
+    legacy = options.get("legacy", None)
+    uefi = options.get("uefi", None)
+    write_cmdline = options.get("write_cmdline", True)
+    write_defaults = options.get("write_defaults", True)
+    ignition = options.get("ignition", False)
+    saved_entry = options.get("saved_entry")
+    cfg = options.get("config", {})
+
+    # backwards compatibility
+    if not root_fs:
+        root_fs = {"uuid": options["root_fs_uuid"]}
+
+    if not boot_fs and "boot_fs_uuid" in options:
+        boot_fs = {"uuid": options["boot_fs_uuid"]}
+
+    # legacy boolean means the
+    if isinstance(legacy, bool) and legacy:
+        legacy = "i386-pc"
+
+    # Check if hybrid boot support is requested, i.e. the resulting image
+    # should support booting via legacy and also UEFI. In that case the
+    # canonical grub.cfg and the grubenv will be in /boot/grub2. The ESP
+    # will only contain a small config file redirecting to the one in
+    # /boot/grub2 and will not have a grubenv itself.
+    hybrid = uefi and legacy
+
+    # Prepare the actual grub configuration file, will be written further down
+    config = GrubConfig(root_fs, boot_fs)
+    config.ignition = ignition
+    config.greenboot = options.get("greenboot", False)
+    config.kernel_opts = kernel_opts
+    config.serial = cfg.get("serial")
+    config.terminal_input = cfg.get("terminal_input")
+    config.terminal_output = cfg.get("terminal_output")
+    config.timeout = cfg.get("timeout", 0)
+    config.default_entry = cfg.get("default")
+
+    # Create the configuration file that determines how grub.cfg is generated.
+    if write_defaults:
+        os.makedirs(f"{tree}/etc/default", exist_ok=True)
+        with open(f"{tree}/etc/default/grub", "w") as default:
+            default.write(config.defaults())
+
+    os.makedirs(f"{tree}/boot/grub2", exist_ok=True)
+    grubenv = f"{tree}/boot/grub2/grubenv"
+
+    if hybrid:
+        # The rpm grub2-efi package will have installed a symlink from
+        # /boot/grub2/grubenv to the ESP. In the case of hybrid boot we
+        # want a single grubenv in /boot/grub2; therefore remove the link
+        try:
+            os.unlink(grubenv)
+        except FileNotFoundError:
+            pass
+
+    with open(grubenv, "w") as env:
+        fs_type, fs_id = fs_spec_decode(root_fs)
+        data = "# GRUB Environment Block\n"
+
+        if write_cmdline:
+            data += f"kernelopts=root={fs_type}={fs_id} {kernel_opts}\n"
+
+        if saved_entry:
+            data += f"saved_entry={saved_entry}\n"
+
+        # The 'grubenv' file is, according to the documentation,
+        # a 'preallocated 1024-byte file'. The empty space is
+        # needs to be filled with '#' as padding
+        data += '#' * (1024 - len(data))
+        assert len(data) == 1024
+
+        print(data)
+        env.write(data)
+
+    if uefi is not None:
+        # UEFI support:
+        # The following config files are needed for UEFI support:
+        # /boot/efi/EFI/<vendor>/
+        # - grubenv: in the case of non-hybrid boot it should have
+        #     been written to via the link from /boot/grub2/grubenv
+        #     created by grub2-efi-{x64, ia32}.rpm
+        # - grub.cfg: needs to be generated, either the canonical one
+        #     or a shim one that redirects to the canonical one in
+        #     /boot/grub2 in case of hybrid boot (see above)
+        vendor = uefi["vendor"]
+        unified = uefi.get("unified", False)
+
+        # EFI binaries and accompanying data can be installed from
+        # the build root instead of using an rpm package
+        if uefi.get('install', False):
+            copy_efi_data(tree, vendor)
+
+        grubcfg = f"boot/efi/EFI/{vendor}/grub.cfg"
+        if hybrid or unified:
+            config.write_redirect(tree, grubcfg)
+        else:
+            config.path = grubcfg
+
+    # Now actually write the main grub.cfg file
+    config.write(tree)
+
+    if legacy:
+        copy_modules(tree, legacy)
+        copy_font(tree)
+
+    return 0
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["tree"], args["options"])
+    sys.exit(r)

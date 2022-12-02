@@ -1,0 +1,61 @@
+# https://packit.dev/docs/configuration/
+
+specfile_path: osbuild.spec
+
+synced_files:
+    - osbuild.spec
+    - .packit.yaml
+
+upstream_package_name: osbuild
+downstream_package_name: osbuild
+
+copy_upstream_release_description: true
+
+upstream_tag_template: v{version}
+
+srpm_build_deps: []
+actions:
+  get-current-version: bash -c "git describe --tags --abbrev=0 | sed 's|v||'"
+
+jobs:
+- job: copr_build
+  trigger: pull_request
+  metadata:
+    targets:
+    - centos-stream-8-aarch64
+    - centos-stream-8-x86_64
+    - centos-stream-9-aarch64
+    - centos-stream-9-x86_64
+    - epel-8-aarch64
+    - epel-8-x86_64
+    - fedora-all-aarch64
+    - fedora-all-s390x
+    - fedora-all-ppc64le
+    - fedora-all
+- job: copr_build
+  trigger: commit
+  metadata:
+    branch: main
+    owner: "@osbuild" # copr repo namespace
+    project: osbuild  # copr repo name so you can consume the builds
+    targets:
+    - centos-stream-8-aarch64
+    - centos-stream-8-x86_64
+    - centos-stream-9-aarch64
+    - centos-stream-9-x86_64
+    - epel-8-aarch64
+    - epel-8-x86_64
+    - fedora-all-aarch64
+    - fedora-all-s390x
+    - fedora-all-ppc64le
+    - fedora-all
+- job: propose_downstream
+  trigger: release
+  metadata:
+    dist_git_branches:
+      - fedora-all
+- job: koji_build
+  trigger: commit
+  metadata:
+    dist_git_branches:
+      - fedora-all

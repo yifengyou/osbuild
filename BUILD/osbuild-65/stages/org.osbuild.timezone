@@ -1,0 +1,54 @@
+#!/usr/bin/python3
+"""
+Set system timezone
+
+Set the system's timezone to `zone`, which should be a valid time zone
+identifier from the tz database - like "America/New York" or "Europe/Berlin".
+
+Removes `/etc/localtime`, then runs the host's `systemd-firstboot` binary with
+the `--timezone` option, which will re-create `/etc/localtime`.
+"""
+
+
+import subprocess
+import sys
+import os
+
+import osbuild.api
+
+
+SCHEMA = """
+"additionalProperties": false,
+"required": ["zone"],
+"properties": {
+  "zone": {
+    "type": "string",
+    "description": "Timezone identifier (from tzdb/zoneinfo)"
+  }
+}
+"""
+
+
+def main(tree, options):
+    zone = options["zone"]
+
+    # We need to remove the /etc/localtime symlink first, because it is created while we install RPM packages.
+    # systemd-firstboot expects that if /etc/localtime exists it is a user-defined value and does not change it, but
+    # the assumption is wrong, because it contains a default value from RPM package.
+    # This is (hopefully) a temporary workaround.
+    try:
+        os.remove(f"{tree}/etc/localtime")
+        # ^ This will fail once systemd RPM package stops shipping the file
+        print("/etc/localtime already exists. Replacing.")
+    except FileNotFoundError:
+        pass
+
+    subprocess.run(["systemd-firstboot", f"--root={tree}", f"--timezone={zone}"], check=True)
+
+    return 0
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["tree"], args["options"])
+    sys.exit(r)

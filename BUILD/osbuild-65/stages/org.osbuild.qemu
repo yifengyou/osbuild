@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+"""
+Convert a disk image to a different format.
+
+Convert the disk image specified via the `image` input to the
+format specified in `format`. Currently supported types are:
+  qcow2, vdi, vmdk, vpc, vhdx.
+
+Some formats support format specific options:
+  qcow2: The compatibility version can be specified via `compat`.
+
+Buildhost commands used: `qemu-img`.
+"""
+
+import os
+import subprocess
+import sys
+
+import osbuild.api
+
+
+SCHEMA_2 = r"""
+"definitions": {
+  "qcow2": {
+    "description": "Create a qcow2 image",
+    "type": "object",
+    "required": ["type"],
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "description": "The type of the format, here 'qcow2'",
+        "type": "string",
+        "enum": ["qcow2"]
+      },
+      "compat": {
+        "description": "The qcow2-compatibility-version to use",
+        "type": "string"
+      }
+    }
+  },
+  "vdi": {
+    "description": "Create a vdi image",
+    "type": "object",
+    "required": ["type"],
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "description": "The type of the format, here 'vdi'",
+        "type": "string",
+        "enum": ["vdi"]
+      }
+    }
+  },
+  "vmdk": {
+    "description": "Create a vmdk image",
+    "type": "object",
+    "required": ["type"],
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "description": "The type of the format, here 'vmdk'",
+        "type": "string",
+        "enum": ["vmdk"]
+      },
+      "subformat": {
+        "description": "VMDK flat extent format",
+        "type": "string",
+        "enum": ["monolithicSparse", "monolithicFlat", "twoGbMaxExtentSparse", "twoGbMaxExtentFlat", "streamOptimized"]
+      }
+    }
+  },
+  "vpc": {
+    "description": "Create a vpc image",
+    "type": "object",
+    "required": ["type"],
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "description": "The type of the format, here 'vpc'",
+        "type": "string",
+        "enum": ["vpc"]
+      },
+      "force_size": {
+        "description": "Force disk size calculation to use the actual size specified, rather than using the nearest CHS-based calculation",
+        "type": "boolean",
+        "default": true
+      },
+      "subformat": {
+        "description": "Type of virtual hard disk format",
+        "type": "string",
+        "default": "fixed",
+        "enum": ["fixed", "dynamic"]
+      }
+    }
+  },
+  "vhdx": {
+    "description": "Create a vhdx image",
+    "type": "object",
+    "required": ["type"],
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "description": "The type of the format, here 'vhdx'",
+        "type": "string",
+        "enum": ["vhdx"]
+      }
+    }
+  }
+},
+"inputs": {
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+},
+"options": {
+  "additionalProperties": false,
+  "required": ["filename", "format"],
+  "properties": {
+    "filename": {
+      "description": "Filename for resulting image",
+      "type": "string"
+    },
+    "format": {
+      "oneOf": [
+        {"$ref": "#/definitions/qcow2"},
+        {"$ref": "#/definitions/vdi"},
+        {"$ref": "#/definitions/vmdk"},
+        {"$ref": "#/definitions/vpc"},
+        {"$ref": "#/definitions/vhdx"}
+      ]
+    }
+  }
+}
+"""
+
+
+def qcow2_arguments(options):
+    argv = ["-c"]
+    compat = options.get("compat")
+
+    if compat:
+        argv += ["-o", f"compat={compat}"]
+    return argv
+
+
+def vmdk_arguments(options):
+    argv = ["-c"]
+    subformat = options.get("subformat")
+    if subformat:
+        argv += ["-o", f"subformat={subformat}"]
+    return argv
+
+
+def vpc_arguments(options):
+    subformat = options.get("subformat", "fixed")
+    opts = [f"subformat={subformat}"]
+
+    if options.get("force_size", True):
+        opts += ["force_size"]
+
+    return ["-o", ",".join(opts)]
+
+
+def parse_input(inputs):
+    image = inputs["image"]
+    files = image["data"]["files"]
+    assert len(files) == 1
+
+    filename, _ = files.popitem()
+    filepath = os.path.join(image["path"], filename)
+    return filepath
+
+
+def main(inputs, output, options):
+    filename = options["filename"].lstrip("/")
+    fmt = options["format"]
+
+    source = parse_input(inputs)
+    target = os.path.join(output, filename)
+
+    formats = {
+        "qcow2": qcow2_arguments,
+        "vdi": [],
+        "vmdk": vmdk_arguments,
+        "vpc": vpc_arguments,
+        "vhdx": []
+    }
+
+    extra_args = formats[fmt["type"]]
+
+    if callable(extra_args):
+        extra_args = extra_args(fmt)
+
+    coroutines = os.environ.get("OSBUILD_QEMU_IMG_COROUTINES")
+    if coroutines:
+        print(f"qemu-img coroutines: {coroutines}")
+        extra_args += ["-m", coroutines]
+
+    cmd = [
+        "qemu-img", "convert",
+        "-O", fmt["type"],
+        *extra_args,
+        source, target
+    ]
+
+    subprocess.run(
+        cmd, check=True
+    )
+
+    return 0
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["inputs"], args["tree"], args["options"])
+    sys.exit(r)

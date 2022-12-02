@@ -1,0 +1,15 @@
+{
+  "added_files": [
+    "/etc",
+    "/etc/NetworkManager",
+    "/etc/NetworkManager/system-connections",
+    "/etc/NetworkManager/system-connections/test.conf",
+    "/usr",
+    "/usr/lib",
+    "/usr/lib/NetworkManager",
+    "/usr/lib/NetworkManager/system-connections",
+    "/usr/lib/NetworkManager/system-connections/osbuild.nmconnection"
+  ],
+  "deleted_files": [],
+  "differences": {}
+}

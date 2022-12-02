@@ -1,0 +1,14 @@
+{
+  "added_files": [
+    "/etc/dnf/vars/releasever"
+  ],
+  "deleted_files": [],
+  "differences": {
+    "/etc/dnf/dnf.conf": {
+      "content": [
+        "sha256:c517559154f0de26716dd6464fbf524aeebf965cb8cf89ebde69e51355633878",
+        "sha256:1469ad98fc3bb8c2d88d5bdb81eb5f91c48107a5ecabcafd5025b03d9d215325"
+      ]
+    }
+  }
+}

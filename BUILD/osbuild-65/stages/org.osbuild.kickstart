@@ -1,0 +1,236 @@
+#!/usr/bin/python3
+"""
+Create an Anaconda kickstart file
+
+Kickstart files are a way to program the Anaconda
+installer.  This stage can be used to create such
+a kickstart file at the location given by `path`.
+
+Only a very limited set of available kickstart
+commands are supported here.
+"""
+
+import sys
+import os
+
+from typing import Dict, List
+
+import osbuild.api
+
+
+SCHEMA = """
+"additionalProperties": false,
+"required": ["path"],
+"properties": {
+  "path": {
+    "type": "string",
+    "description": "Where to place the kickstart file"
+  },
+  "ostree": {
+    "type": "object",
+    "required": ["osname", "url", "ref"],
+    "additionalProperties": false,
+    "properties": {
+      "osname": {
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      },
+      "ref": {
+        "type": "string"
+      },
+      "remote": {
+        "type": "string",
+        "description": "The remote to tie tie commit to"
+      },
+      "gpg": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  },
+  "liveimg": {
+    "type": "object",
+    "required": ["url"],
+    "properties": {
+      "url": {
+        "type": "string"
+      }
+    }
+  },
+  "groups": {
+    "type": "object",
+    "additionalProperties": false,
+    "description": "Keys are group names, values are objects with group info",
+    "patternProperties": {
+      "^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$": {
+        "type": "object",
+        "properties": {
+          "gid": {
+            "type": "number",
+            "description": "GID for this group"
+          }
+        }
+      }
+    }
+  },
+  "users": {
+    "additionalProperties": false,
+    "type": "object",
+    "description": "Keys are usernames, values are objects giving user info.",
+    "patternProperties": {
+      "^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$": {
+        "type": "object",
+        "properties": {
+          "uid": {
+            "description": "User UID",
+            "type": "number"
+          },
+          "gid": {
+            "description": "User GID",
+            "type": "number"
+          },
+          "groups": {
+            "description": "Array of group names for this user",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "description": "User account description (or full name)",
+            "type": "string"
+          },
+          "home": {
+            "description": "Path to user's home directory",
+            "type": "string"
+          },
+          "shell": {
+            "description": "User's login shell",
+            "type": "string"
+          },
+          "password": {
+            "description": "User's encrypted password, as returned by crypt(3)",
+            "type": "string"
+          },
+          "key": {
+            "description": "SSH Public Key to add to ~/.ssh/authorized_keys",
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def make_groups(groups: Dict) -> List[str]:
+    # group --name NAME [--gid GID]
+
+    res = []
+
+    for name, opts in groups.items():
+        gid = opts.get("gid")
+
+        arguments = [f"group --name {name}"]
+        if gid:
+            arguments += ["--gid", str(gid)]
+
+        res.append(" ".join(arguments))
+
+    return res
+
+
+def make_users(users: Dict) -> List[str]:
+    # user [--homedir HOMEDIR] [--iscrypted] --name NAME [--password PASSWORD]
+    # [--shell SHELL] [--uid INT] [--lock] [--plaintext] [--gecos GECOS]
+    # [--gid INT] [--groups GROUPS]
+
+    res = []
+
+    for name, opts in users.items():
+
+        arguments = [f"user --name {name}"]
+
+        password = opts.get("password")
+        if password is not None:
+            arguments += ["--password", password or '""', "--iscrypted"]
+
+        shell = opts.get("shell")
+        if shell:
+            arguments += ["--shell", shell]
+
+        uid = opts.get("uid")
+        if uid is not None:
+            arguments += ["--uid", str(uid)]
+
+        gid = opts.get("gid")
+        if gid is not None:
+            arguments += ["--gid", str(gid)]
+
+        groups = opts.get("groups")
+        if groups:
+            arguments += ["--groups", ",".join(groups)]
+
+        home = opts.get("home")
+        if home:
+            arguments += ["--homedir", home]
+
+        res.append(" ".join(arguments))
+
+        key = opts.get("key")
+        if key:
+            res.append(f'sshkey --username {name} "{key}"')
+
+    return res
+
+
+def main(tree, options):
+    path = options["path"].lstrip("/")
+    ostree = options.get("ostree")
+
+    config = []
+
+    if ostree:
+        osname, url, ref = ostree["osname"], ostree["url"], ostree["ref"]
+        remote = ostree.get("remote")
+
+        cmd = f"ostreesetup --osname={osname} --url={url} --ref={ref}"
+
+        if remote:
+            cmd += " --remote=" + remote
+        if not ostree.get("gpg", True):
+            cmd += " --nogpg"
+
+        config += [cmd]
+
+    liveimg = options.get("liveimg")
+    if liveimg:
+        url = liveimg["url"]
+        config += [f"liveimg --url {url}"]
+
+    config += make_groups(options.get("groups", {}))
+    config += make_users(options.get("users", {}))
+
+    target = os.path.join(tree, path)
+    base = os.path.dirname(target)
+    os.makedirs(base, exist_ok=True)
+
+    with open(target, "w") as f:
+        if config:
+            f.write("\n".join(config))
+        f.write("\n")
+
+    print(f"created kickstarted at: {path}\n")
+    with open(target, "r") as f:
+        print(f.read())
+
+    return 0
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    r = main(args["tree"], args["options"])
+    sys.exit(r)

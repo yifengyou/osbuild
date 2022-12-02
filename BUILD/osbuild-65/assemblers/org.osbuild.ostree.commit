@@ -1,0 +1,194 @@
+#!/usr/bin/python3
+"""
+Assemble a file system tree into a ostree commit
+
+Takes a file system tree that is already conforming to the ostree
+system layout[1] and commits it to an archive repository.
+
+The repository is located at the `/repo` directory and additional
+metadata is stored in `/compose.json` which contains the commit
+compose information.
+
+Alternatively, if the `tar` option is supplied, the repository and
+the `compose.json` will be archived in a file named via the
+`tar.filename` option. This supports auto-compression via the file
+extension (see the tar man page). Requires the `tar` command to be
+in the build root.
+
+[1] https://ostree.readthedocs.io/en/stable/manual/adapting-existing/
+"""
+
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+from osbuild import api
+from osbuild.util import ostree
+
+
+CAPABILITIES = ["CAP_MAC_ADMIN", "CAP_NET_ADMIN", "CAP_SYS_PTRACE"]
+
+
+SCHEMA = """
+"additionalProperties": false,
+"required": ["ref"],
+"properties": {
+  "ref": {
+    "description": "OStree ref to create for the commit",
+    "type": "string",
+    "default": ""
+  },
+  "os_version": {
+    "description": "Set the version of the OS as commit metadata",
+    "type": "string"
+  },
+  "tmp-is-dir": {
+    "description": "Create a regular directory for /tmp",
+    "type": "boolean",
+    "default": true
+  },
+  "parent": {
+    "description": "commit id of the parent commit",
+    "type": "string"
+  },
+  "tar": {
+    "description": "Emit a tarball as the result",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["filename"],
+    "properties": {
+      "filename": {
+        "description": "File-name of the tarball to create. Compression is determined by the extension.",
+        "type": "string"
+      }
+    }
+  }
+}
+"""
+
+
+TOPLEVEL_DIRS = ["dev", "proc", "run", "sys", "sysroot", "var"]
+TOPLEVEL_LINKS = {
+    "home": "var/home",
+    "media": "run/media",
+    "mnt": "var/mnt",
+    "opt": "var/opt",
+    "ostree": "sysroot/ostree",
+    "root": "var/roothome",
+    "srv": "var/srv",
+}
+
+
+def copy(name, source, dest):
+    subprocess.run(["cp", "--reflink=auto", "-a",
+                    os.path.join(source, name),
+                    "-t", os.path.join(dest)],
+                   check=True)
+
+
+def init_rootfs(root, tmp_is_dir):
+    """Initialize a pristine root file-system"""
+
+    fd = os.open(root, os.O_DIRECTORY)
+
+    os.fchmod(fd, 0o755)
+
+    for d in TOPLEVEL_DIRS:
+        os.mkdir(d, mode=0o755, dir_fd=fd)
+        os.chmod(d, mode=0o755, dir_fd=fd)
+
+    for l, t in TOPLEVEL_LINKS.items():
+        # <dir_fd>/l -> t
+        os.symlink(t, l, dir_fd=fd)
+
+    if tmp_is_dir:
+        os.mkdir("tmp", mode=0o1777, dir_fd=fd)
+        os.chmod("tmp", mode=0o1777, dir_fd=fd)
+    else:
+        os.symlink("tmp", "sysroot/tmp", dir_fd=fd)
+
+
+def main(tree, output_dir, options, meta):
+    ref = options["ref"]
+    os_version = options.get("os_version", None)
+    tmp_is_dir = options.get("tmp-is-dir", True)
+    parent = options.get("parent", None)
+    tar = options.get("tar", None)
+
+    with tempfile.TemporaryDirectory(dir=output_dir) as root:
+        print("Initializing root filesystem", file=sys.stderr)
+        init_rootfs(root, tmp_is_dir)
+
+        print("Copying data", file=sys.stderr)
+        copy("usr", tree, root)
+        copy("boot", tree, root)
+        copy("var", tree, root)
+
+        for name in ["bin", "lib", "lib32", "lib64", "sbin"]:
+            if os.path.lexists(f"{tree}/{name}"):
+                copy(name, tree, root)
+
+        repo = os.path.join(output_dir, "repo")
+
+        subprocess.run(["ostree",
+                        "init",
+                        "--mode=archive",
+                        f"--repo={repo}"],
+                       stdout=sys.stderr,
+                       check=True)
+
+        treefile = ostree.Treefile()
+        treefile["ref"] = ref
+
+        argv = ["rpm-ostree", "compose", "commit"]
+        argv += [f"--repo={repo}"]
+
+        if parent:
+            argv += [f"--parent={parent}"]
+
+        if os_version:
+            argv += [
+                f"--add-metadata-string=version={os_version}",
+            ]
+
+        argv += [
+            f"--add-metadata-string=rpmostree.inputhash={meta['id']}",
+            f"--write-composejson-to={output_dir}/compose.json"
+        ]
+
+        with treefile.as_tmp_file() as path:
+            argv += [path, root]
+
+            subprocess.run(argv,
+                           stdout=sys.stderr,
+                           check=True)
+
+        with open(os.path.join(output_dir, "compose.json"), "r") as f:
+            compose = json.load(f)
+
+        api.metadata({"compose": compose})
+
+    if tar:
+        filename = tar["filename"]
+        command = [
+            "tar",
+            "--remove-files",
+            "--auto-compress",
+            "-cf", os.path.join(output_dir, filename),
+            "-C", output_dir,
+            "repo", "compose.json"
+        ]
+        subprocess.run(command,
+                       stdout=sys.stderr,
+                       check=True)
+
+
+if __name__ == '__main__':
+    args = api.arguments()
+    args_input = args["inputs"]["tree"]["path"]
+    args_output = args["tree"]
+    r = main(args_input, args_output, args["options"], args["meta"])
+    sys.exit(r)

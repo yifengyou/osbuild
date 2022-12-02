@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+"""
+Partition a target using sfdisk(8)
+"""
+
+import json
+import subprocess
+import sys
+
+from typing import Optional
+
+import osbuild.api
+
+
+SCHEMA_2 = r"""
+"devices": {
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["device"],
+  "properties": {
+    "device": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+},
+"options": {
+  "additionalProperties": false,
+  "required": ["label", "uuid"],
+  "properties": {
+    "uuid": {
+      "description": "UUID for the disk image's partition table",
+      "type": "string"
+    },
+    "label": {
+      "description": "The type of the partition table",
+      "type": "string",
+      "enum": ["mbr", "dos", "gpt"]
+    },
+    "partitions": {
+      "description": "Partition layout ",
+      "type": "array",
+      "items": {
+        "description": "Description of one partition",
+        "type": "object",
+        "properties": {
+          "bootable": {
+            "description": "Mark the partition as bootable (dos)",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "The partition name (GPT)",
+            "type": "string"
+          },
+          "size": {
+            "description": "The size of this partition",
+            "type": "integer"
+          },
+          "start": {
+            "description": "The start offset of this partition",
+            "type": "integer"
+          },
+          "type": {
+            "description": "The partition type (UUID or identifier)",
+            "type": "string"
+          },
+          "uuid": {
+            "description": "UUID of the partition (GPT)",
+            "type": "string"
+          },
+          "attrs": {
+            "description": "Attributes of the partition (GPT)",
+            "type": "array",
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+class Partition:
+    def __init__(self,
+                 pttype: str = None,
+                 start: int = None,
+                 size: int = None,
+                 bootable: bool = False,
+                 name: str = None,
+                 uuid: str = None,
+                 attrs: int = None):
+        self.type = pttype
+        self.start = start
+        self.size = size
+        self.bootable = bootable
+        self.name = name
+        self.uuid = uuid
+        self.index = None
+        self.attrs = attrs
+
+    @property
+    def start_in_bytes(self):
+        return (self.start or 0) * 512
+
+    @property
+    def size_in_bytes(self):
+        return (self.size or 0) * 512
+
+
+class PartitionTable:
+    def __init__(self, label, uuid, partitions):
+        self.label = label
+        self.uuid = uuid
+        self.partitions = partitions or []
+
+    def __getitem__(self, key) -> Partition:
+        return self.partitions[key]
+
+    def find_prep_partition(self) -> Optional[Partition]:
+        """Find the PReP partition'"""
+        if self.label == "dos":
+            prep_type = "41"
+        elif self.label == "gpt":
+            prep_type = "9E1A2D38-C612-4316-AA26-8B49521E5A8B"
+
+        for part in self.partitions:
+            if part.type.upper() == prep_type:
+                return part
+        return None
+
+    def find_bios_boot_partition(self) -> Optional[Partition]:
+        """Find the BIOS-boot Partition"""
+        bb_type = "21686148-6449-6E6F-744E-656564454649"
+        for part in self.partitions:
+            if part.type.upper() == bb_type:
+                return part
+        return None
+
+    def write_to(self, target, sync=True):
+        """Write the partition table to disk"""
+        # generate the command for sfdisk to create the table
+        command = f"label: {self.label}\nlabel-id: {self.uuid}"
+        for partition in self.partitions:
+            fields = []
+            for field in ["start", "size", "type", "name", "uuid", "attrs"]:
+                value = getattr(partition, field)
+                if value:
+                    if field == "attrs":
+                        # make a list into a comma-separated string
+                        attr_list = [str(element) for element in value]
+                        value = ",".join(attr_list)
+                    fields += [f'{field}="{value}"']
+            if partition.bootable:
+                fields += ["bootable"]
+            command += "\n" + ", ".join(fields)
+
+        print(command)
+
+        subprocess.run(["sfdisk", "-q", "--no-tell-kernel", target],
+                       input=command,
+                       encoding='utf-8',
+                       check=True)
+
+        if sync:
+            self.update_from(target)
+
+    def update_from(self, target):
+        """Update and fill in missing information from disk"""
+        r = subprocess.run(["sfdisk", "--json", target],
+                           stdout=subprocess.PIPE,
+                           encoding='utf-8',
+                           check=True)
+        disk_table = json.loads(r.stdout)["partitiontable"]
+        disk_parts = disk_table["partitions"]
+
+        assert len(disk_parts) == len(self.partitions)
+        for i, part in enumerate(self.partitions):
+            part.index = i
+            part.start = disk_parts[i]["start"]
+            part.size = disk_parts[i]["size"]
+            part.type = disk_parts[i].get("type")
+            part.name = disk_parts[i].get("name")
+            part.attrs = disk_parts[i].get("attrs")
+
+
+def partition_from_json(js) -> Partition:
+    p = Partition(pttype=js.get("type"),
+                  start=js.get("start"),
+                  size=js.get("size"),
+                  bootable=js.get("bootable"),
+                  name=js.get("name"),
+                  uuid=js.get("uuid"),
+                  attrs=js.get("attrs"))
+    return p
+
+
+def main(devices, options):
+    device = devices["device"]["path"]
+
+    ptuuid = options["uuid"]
+    pttype = options["label"]
+    partitions = options.get("partitions")
+
+    parts = [partition_from_json(p) for p in partitions]
+    pt = PartitionTable(pttype, ptuuid, parts)
+
+    pt.write_to(device)
+
+    subprocess.run(["sfdisk", "--json", device],
+                   encoding='utf-8',
+                   check=False)
+
+
+if __name__ == '__main__':
+    args = osbuild.api.arguments()
+    ret = main(args["devices"], args["options"])
+    sys.exit(ret)

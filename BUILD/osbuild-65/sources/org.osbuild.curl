@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+"""
+Source for downloading files from URLs.
+
+The files are indexed by their content hash. Can download files
+that require secrets. The only secret provider currently supported
+is `org.osbuild.rhsm` for downloading Red Hat content that requires
+a subscriptions.
+
+Internally use curl to download the files; the files are cached in
+an internal cache. Multiple parallel connections are used to speed
+up the download.
+"""
+
+
+import os
+import subprocess
+import sys
+import tempfile
+
+from osbuild import sources
+
+from osbuild.util.checksum import verify_file
+from osbuild.util.rhsm import Subscriptions
+
+
+SCHEMA = """
+"additionalProperties": false,
+"definitions": {
+  "item": {
+    "description": "The files to fetch indexed their content checksum",
+    "type": "object",
+    "additionalProperties": false,
+    "patternProperties": {
+      "(md5|sha1|sha256|sha384|sha512):[0-9a-f]{32,128}": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "URL to download the file from."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "url"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "URL to download the file from."
+              },
+              "insecure": {
+                "type": "boolean",
+                "description": "Skip the verification step for secure connections and proceed without checking",
+                "default": false
+              },
+              "secrets": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of the secrets provider."
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+},
+"properties": {
+  "items": {"$ref": "#/definitions/item"},
+  "urls": {"$ref": "#/definitions/item"}
+},
+"oneOf": [{
+  "required": ["items"]
+}, {
+  "required": ["urls"]
+}]
+"""
+
+
+class CurlSource(sources.SourceService):
+
+    content_type = "org.osbuild.files"
+
+    max_workers = 2 * (os.cpu_count() or 1)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subscriptions = None
+
+    def transform(self, checksum, desc):
+        url = desc
+        if not isinstance(url, dict):
+            url = {"url": url}
+
+        # check if url needs rhsm secrets
+        if url.get("secrets", {}).get("name") == "org.osbuild.rhsm":
+            # rhsm secrets only need to be retrieved once and can then be reused
+            if self.subscriptions is None:
+                self.subscriptions = Subscriptions.from_host_system()
+            url["secrets"] = self.subscriptions.get_secrets(url.get("url"))
+
+        return checksum, url
+
+    def fetch_one(self, checksum, desc):
+        secrets = desc.get("secrets")
+        insecure = desc.get("insecure")
+        url = desc.get("url")
+        # Download to a temporary sub cache until we have verified the checksum. Use a
+        # subdirectory, so we avoid copying across block devices.
+        with tempfile.TemporaryDirectory(prefix="osbuild-unverified-file-", dir=self.cache) as tmpdir:
+            # some mirrors are sometimes broken. retry manually, because we could be
+            # redirected to a different, working, one on retry.
+            return_code = 0
+            for _ in range(10):
+                curl_command = [
+                    "curl",
+                    "--silent",
+                    "--speed-limit", "1000",
+                    "--connect-timeout", "30",
+                    "--fail",
+                    "--location",
+                    "--output", checksum,
+                ]
+                if secrets:
+                    if secrets.get('ssl_ca_cert'):
+                        curl_command.extend(["--cacert", secrets.get('ssl_ca_cert')])
+                    if secrets.get('ssl_client_cert'):
+                        curl_command.extend(["--cert", secrets.get('ssl_client_cert')])
+                    if secrets.get('ssl_client_key'):
+                        curl_command.extend(["--key", secrets.get('ssl_client_key')])
+
+                if insecure:
+                    curl_command.append("--insecure")
+
+                # url must follow options
+                curl_command.append(url)
+
+                curl = subprocess.run(curl_command, encoding="utf-8", cwd=tmpdir, check=False)
+                return_code = curl.returncode
+                if return_code == 0:
+                    break
+            else:
+                raise RuntimeError(f"curl: error downloading {url}: error code {return_code}")
+
+            if not verify_file(f"{tmpdir}/{checksum}", checksum):
+                raise RuntimeError(f"checksum mismatch: {checksum} {url}")
+
+            # The checksum has been verified, move the file into place. in case we race
+            # another download of the same file, we simply ignore the error as their
+            # contents are guaranteed to be  the same.
+            try:
+                os.rename(f"{tmpdir}/{checksum}", f"{self.cache}/{checksum}")
+            except FileExistsError:
+                pass
+
+
+def main():
+    service = CurlSource.from_args(sys.argv[1:])
+    service.main()
+
+
+if __name__ == '__main__':
+    main()

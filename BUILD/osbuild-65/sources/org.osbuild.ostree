@@ -1,0 +1,140 @@
+#!/usr/bin/python3
+"""Fetch OSTree commits from an repository
+
+Uses ostree to pull specific commits from (remote) repositories
+at the provided `url`. Can verify the commit, if one or more
+gpg keys are provided via `gpgkeys`.
+"""
+
+
+import os
+import sys
+import subprocess
+import uuid
+from osbuild.util.ostree import show
+
+from osbuild import sources
+
+
+SCHEMA = """
+"additionalProperties": false,
+"definitions": {
+  "item": {
+    "description": "The commits to fetch indexed their checksum",
+    "type": "object",
+    "additionalProperties": false,
+    "patternProperties": {
+      "[0-9a-f]{5,64}": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["remote"],
+        "properties": {
+          "remote": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["url"],
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "URL of the repository."
+              },
+              "gpgkeys": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "GPG keys to verify the commits"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+},
+"properties": {
+  "items": {"$ref": "#/definitions/item"},
+  "commits": {"$ref": "#/definitions/item"}
+},
+"oneOf": [{
+  "required": ["items"]
+}, {
+  "required": ["commits"]
+}]
+"""
+
+
+def ostree(*args, _input=None, **kwargs):
+    args = list(args) + [f'--{k}={v}' for k, v in kwargs.items()]
+    print("ostree " + " ".join(args), file=sys.stderr)
+    subprocess.run(["ostree"] + args,
+                   encoding="utf-8",
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.STDOUT,
+                   input=_input,
+                   check=True)
+
+
+class OSTreeSource(sources.SourceService):
+
+    content_type = "org.osbuild.ostree"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.repo = None
+
+    def fetch_one(self, checksum, desc):
+        commit = checksum
+        remote = desc["remote"]
+        url = remote["url"]
+        gpg = remote.get("gpgkeys", [])
+        uid = str(uuid.uuid4())
+
+        verify_args = []
+        if not gpg:
+            verify_args = ["--no-gpg-verify"]
+
+        ostree("remote", "add",
+               uid, url,
+               *verify_args,
+               repo=self.repo)
+
+        for key in gpg:
+            ostree("remote", "gpg-import", "--stdin", uid,
+                   repo=self.repo, _input=key)
+
+        # Transfer the commit: remote → cache
+        print(f"pulling {commit}", file=sys.stderr)
+        ostree("pull", uid, commit, repo=self.repo)
+
+        # Remove the temporary remotes again
+        ostree("remote", "delete", uid,
+               repo=self.repo)
+
+    def setup(self, args):
+        super().setup(args)
+        # Prepare the cache and the output repo
+        self.repo = os.path.join(self.cache, "repo")
+        ostree("init", mode="archive", repo=self.repo)
+
+        # Make sure the cache repository uses locks to protect the metadata during
+        # shared access. This is the default since `2018.5`, but lets document this
+        # explicitly here.
+        ostree("config", "set", "repo.locking", "true", repo=self.repo)
+
+    # pylint: disable=[no-self-use]
+    def exists(self, checksum, _desc):
+        try:
+            show(self.repo, checksum)
+        except RuntimeError:
+            return False
+        return True
+
+
+def main():
+    service = OSTreeSource.from_args(sys.argv[1:])
+    service.main()
+
+
+if __name__ == '__main__':
+    main()

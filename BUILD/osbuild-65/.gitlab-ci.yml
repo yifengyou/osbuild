@@ -1,0 +1,108 @@
+stages:
+  - init
+  - rpmbuild
+  - test
+  - finish
+
+.terraform:
+  before_script:
+    - schutzbot/ci_details.sh > ci-details-before-run
+  after_script:
+    - schutzbot/ci_details.sh > ci-details-after-run
+    - schutzbot/update_github_status.sh update
+  tags:
+    - terraform
+  artifacts:
+    paths:
+      - ci-details-before-run
+      - ci-details-after-run
+
+init:
+  stage: init
+  tags:
+    - shell
+  script:
+    - schutzbot/update_github_status.sh start
+  interruptible: true
+
+RPM:
+  stage: rpmbuild
+  extends: .terraform
+  script:
+    - sh "schutzbot/mockbuild.sh"
+  interruptible: true
+  parallel:
+    matrix:
+      - RUNNER:
+          - aws/fedora-35-x86_64
+          - aws/fedora-35-aarch64
+          - aws/fedora-36-x86_64
+          - aws/fedora-36-aarch64
+          - aws/centos-stream-8-x86_64
+          - aws/centos-stream-8-aarch64
+          - aws/centos-stream-9-x86_64
+          - aws/centos-stream-9-aarch64
+          - aws/rhel-8.6-ga-x86_64
+          - aws/rhel-8.6-ga-aarch64
+          - aws/rhel-9.0-ga-x86_64
+          - aws/rhel-9.0-ga-aarch64
+      - RUNNER:
+          - aws/rhel-8.7-nightly-x86_64
+          - aws/rhel-8.7-nightly-aarch64
+          - aws/rhel-9.1-nightly-x86_64
+          - aws/rhel-9.1-nightly-aarch64
+        INTERNAL_NETWORK: "true"
+
+Composer Tests:
+  stage: test
+  extends: .terraform
+  script:
+    - schutzbot/deploy.sh
+    - /usr/libexec/tests/osbuild-composer/image_tests.sh
+  parallel:
+    matrix:
+      - RUNNER:
+          - aws/fedora-35-x86_64
+          - aws/fedora-35-aarch64
+          - aws/fedora-36-x86_64
+          - aws/fedora-36-aarch64
+          - aws/rhel-8.6-ga-x86_64
+          - aws/rhel-8.6-ga-aarch64
+          - aws/rhel-8.7-nightly-x86_64
+          - aws/rhel-8.7-nightly-aarch64
+          - aws/rhel-9.1-nightly-x86_64
+          - aws/rhel-9.1-nightly-aarch64
+        INTERNAL_NETWORK: "true"
+
+OSTree Images:
+  stage: test
+  extends: .terraform
+  script:
+    - schutzbot/deploy.sh
+    - sudo test/cases/ostree-images
+  parallel:
+    matrix:
+      - RUNNER:
+          - aws/fedora-35-x86_64
+          - aws/fedora-36-x86_64
+          - aws/rhel-8.6-ga-x86_64
+          - aws/rhel-8.7-nightly-x86_64
+          - aws/rhel-9.1-nightly-x86_64
+        INTERNAL_NETWORK: "true"
+
+SonarQube:
+  stage: test
+  extends: .terraform
+  script:
+    - schutzbot/sonarqube.sh
+  variables:
+    RUNNER: aws/centos-stream-8-x86_64
+    INTERNAL_NETWORK: "true"
+    GIT_DEPTH: 0
+
+finish:
+  stage: finish
+  tags:
+    - shell
+  script:
+    - schutzbot/update_github_status.sh finish

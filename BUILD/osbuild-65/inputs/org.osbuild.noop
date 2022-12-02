@@ -1,0 +1,44 @@
+#!/usr/bin/python3
+"""
+No-op inputs
+
+Does nothing with the supplied data but just forwards
+it to the stage.
+"""
+
+
+import os
+import sys
+import uuid
+
+from osbuild import inputs
+
+SCHEMA = """
+"additionalProperties": true
+"""
+
+
+class NoopInput(inputs.InputService):
+
+    def map(self, _store, _origin, refs, target, _options):
+
+        uid = str(uuid.uuid4())
+        path = os.path.join(target, uid)
+        os.makedirs(path)
+
+        reply = {
+            "path": target,
+            "data": {
+                "refs": refs
+            }
+        }
+        return reply
+
+
+def main():
+    service = NoopInput.from_args(sys.argv[1:])
+    service.main()
+
+
+if __name__ == '__main__':
+    main()
